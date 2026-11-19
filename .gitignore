@@ -1,0 +1,5 @@
+.env
+.wwebjs_auth/
+.wwebjs_cache/
+sent-state.json
+node_modules/
