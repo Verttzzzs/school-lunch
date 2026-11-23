@@ -1,4 +1,4 @@
-
+// Load environment variables from .env.
 import 'dotenv/config';
 import fs from 'node:fs/promises';
 import cron from 'node-cron';
@@ -7,12 +7,14 @@ import { chromium } from 'playwright';
 import pkg from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 
+// Global configuration and command-line flags.
 const { Client, LocalAuth } = pkg;
 const TZ = 'Europe/Helsinki';
 
 const dryRun = process.argv.includes('--dry-run');
 const listGroups = process.argv.includes('--list-groups');
 
+// Load the configured menu source URLs.
 const restaurants = JSON.parse(
   await fs.readFile(
     new URL('./restaurants.json', import.meta.url),
@@ -20,6 +22,7 @@ const restaurants = JSON.parse(
   )
 );
 
+// Format dates using Finland time, regardless of the computer time zone.
 const dateStr = () =>
   new Intl.DateTimeFormat('en-CA', {
     timeZone: TZ,
@@ -28,16 +31,20 @@ const dateStr = () =>
     day: '2-digit'
   }).format(new Date());
 
+// Check the weekday in Finland (used to skip weekends).
 const weekday = () =>
   new Intl.DateTimeFormat('en-US', {
     timeZone: TZ,
     weekday: 'short'
   }).format(new Date());
 
+// OpenAI client for translating Finnish menus into English.
 const ai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
+// Open each configured source in Chromium and extract its visible text.
+// A new browser is launched for each call, so old page content is not reused.
 async function getPages() {
   console.log('Starting restaurant menu scraping...');
 
@@ -100,6 +107,7 @@ async function getPages() {
 }
 
 
+// Ask OpenAI to translate and format the scraped menus for WhatsApp.
 async function makeMessage(pages) {
   const date = dateStr();
 
@@ -260,6 +268,7 @@ Return ONLY the formatted menu.`
 }
 
 
+// Main lunch job: skip weekends/duplicates, fetch fresh data, and send once.
 async function run(client) {
   console.log('Starting menu job...');
 
@@ -269,6 +278,7 @@ async function run(client) {
   }
 
   const date = dateStr();
+  // sent-state.json prevents duplicate messages for the same day.
   const stateFile = new URL('./sent-state.json', import.meta.url);
 
   let state = {};
@@ -284,6 +294,7 @@ async function run(client) {
     return;
   }
 
+  // Always fetch the current page when the job runs.
   const pages = await getPages();
   const msg = await makeMessage(pages);
 
@@ -305,6 +316,7 @@ async function run(client) {
 
   await client.sendMessage(id, msg);
 
+  // Save the successful send date for duplicate protection.
   await fs.writeFile(
     stateFile,
     JSON.stringify({
@@ -316,17 +328,21 @@ async function run(client) {
   console.log('Successfully sent menu:', date);
 }
 
+// -----------------------------------------------------------------------------
+// Application entry point
+// -----------------------------------------------------------------------------
+// Dry-run mode previews today's menu without connecting to WhatsApp.
 if (dryRun) {
   await run(null);
-
 } else {
+  // LocalAuth keeps the WhatsApp login session between bot restarts.
   const client = new Client({
     authStrategy: new LocalAuth({
       clientId: 'vamk-lunch'
     }),
-
     puppeteer: {
       headless: false,
+      // Windows Chrome path; replace or configure this when deploying to Linux.
       executablePath:
         'C:\\Users\\Verttzzz\\.cache\\puppeteer\\chrome\\win64-154.0.8037.57\\chrome-win64\\chrome.exe',
       args: ['--no-sandbox'],
@@ -334,60 +350,86 @@ if (dryRun) {
     }
   });
 
+  // Display a QR code if WhatsApp requires a new login.
   client.on('qr', qr => {
     console.log('Scan WhatsApp QR code:');
     qrcode.generate(qr, { small: true });
   });
 
-  client.on('auth_failure', e => {
-    console.error('WhatsApp auth failure:', e);
+  // Report authentication problems in the terminal.
+  client.on('auth_failure', error => {
+    console.error('WhatsApp auth failure:', error);
   });
 
+  // Avoid registering the same scheduled jobs more than once.
+  let schedulesRegistered = false;
+
+  // Start scheduled jobs only after the WhatsApp client is ready.
   client.on('ready', async () => {
     console.log('WhatsApp connected.');
 
+    // Optional utility mode: list WhatsApp groups and exit.
     if (listGroups) {
       const chats = await client.getChats();
-
-      for (const c of chats.filter(c => c.isGroup)) {
-        console.log(`${c.name} | ${c.id._serialized}`);
+      for (const chat of chats.filter(chat => chat.isGroup)) {
+        console.log(`${chat.name} | ${chat.id._serialized}`);
       }
-
       await client.destroy();
       process.exit(0);
     }
 
-    
-const sendOnStart = (process.env.SEND_ON_START || '')
-  .trim()
-  .toLowerCase() === 'true';
+    // SEND_ON_START=true sends immediately after WhatsApp connects.
+    // Keep it false for normal scheduled operation.
+    const sendOnStart = (process.env.SEND_ON_START || '')
+      .trim()
+      .toLowerCase() === 'true';
 
-console.log('SEND_ON_START raw:', JSON.stringify(process.env.SEND_ON_START));
-console.log('Immediate sending enabled:', sendOnStart);
+    console.log('SEND_ON_START raw:', JSON.stringify(process.env.SEND_ON_START));
+    console.log('Immediate sending enabled:', sendOnStart);
 
-if (sendOnStart) {
-  console.log('Starting immediate send...');
+    if (schedulesRegistered) {
+      console.log('Scheduled jobs already registered.');
+      return;
+    }
+    schedulesRegistered = true;
 
-  try {
-    await run(client);
-    console.log('Immediate send finished.');
-  } catch (error) {
-    console.error('Immediate send failed:', error);
-  }
-} else {
-  console.log('Immediate send disabled. Waiting for 09:00.');
-}
+    // Every weekday at 07:00 Finland time: fetch, translate and send the menu.
+    cron.schedule('0 7 * * 1-5', () => {
+      console.log('⏰ Scheduled lunch job triggered.');
+      run(client).catch(error => {
+        console.error('❌ Scheduled lunch job failed:', error);
+      });
+    }, { timezone: TZ });
 
-    cron.schedule(
-      '0 9 * * 1-5',
-      () => run(client).catch(console.error),
-      { timezone: TZ }
-    );
+    // Every Monday at 01:00 Finland time: check that Kurnii can be fetched.
+    // This does NOT cache menu data or send a WhatsApp message.
+    cron.schedule('0 1 * * 1', async () => {
+      console.log('🔄 Monday Kurnii check started.');
+      try {
+        const pages = await getPages();
+        const successful = pages.filter(page => !page.error).length;
+        console.log(`Kurnii check: ${successful}/${pages.length} source(s) fetched.`);
+      } catch (error) {
+        console.error('❌ Monday Kurnii check failed:', error);
+      }
+    }, { timezone: TZ });
 
-    console.log(
-      'Scheduled weekdays 09:00 Europe/Helsinki. Keep process running.'
-    );
+    console.log('Scheduled weekdays 07:00 and Mondays 01:00 Europe/Helsinki.');
+
+    // Optional immediate run for manual testing or startup sending.
+    if (sendOnStart) {
+      console.log('Starting immediate send...');
+      try {
+        await run(client);
+        console.log('Immediate send finished.');
+      } catch (error) {
+        console.error('Immediate send failed:', error);
+      }
+    } else {
+      console.log('Immediate send disabled. Waiting for 07:00.');
+    }
   });
 
+  // Connect to WhatsApp Web and keep the process alive.
   await client.initialize();
 }
