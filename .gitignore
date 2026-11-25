@@ -3,3 +3,7 @@
 .wwebjs_cache/
 sent-state.json
 node_modules/
+
+# Runtime logs, debug artifacts and delivery state
+/logs/
+/delivery-state/

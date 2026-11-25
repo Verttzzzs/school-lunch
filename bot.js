@@ -1,441 +1,78 @@
-// Load environment variables from .env.
+// CLI entry point. Preview mode never instantiates WhatsApp; group listing never schedules delivery.
 import 'dotenv/config';
 import fs from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import cron from 'node-cron';
-import OpenAI from 'openai';
-import { chromium } from 'playwright';
-import pkg from 'whatsapp-web.js';
-import qrcode from 'qrcode-terminal';
+import { helsinki, TZ } from './src/clock.js';
+import { createLogging } from './src/logging.js';
+import { createMenuService } from './src/menu-service.js';
+import { createScheduler } from './src/scheduler.js';
+import { deliveryState } from './src/delivery-state.js';
+import { createWhatsApp, resolveGroups } from './src/whatsapp.js';
+import { parseMode, runManualSend } from './src/cli.js';
 
-// Global configuration and command-line flags.
-const { Client, LocalAuth } = pkg;
-const TZ = 'Europe/Helsinki';
+const path = relative => fileURLToPath(new URL(relative, import.meta.url));
+const createState = legacyGroup => deliveryState(path('./delivery-state/'), path('./sent-state.json'), legacyGroup);
+const { log, artifacts } = createLogging(path('./logs/'));
 
-const dryRun = process.argv.includes('--dry-run');
-const listGroups = process.argv.includes('--list-groups');
-
-// Load the configured menu source URLs.
-const restaurants = JSON.parse(
-  await fs.readFile(
-    new URL('./restaurants.json', import.meta.url),
-    'utf8'
-  )
-);
-
-// Format dates using Finland time, regardless of the computer time zone.
-const dateStr = () =>
-  new Intl.DateTimeFormat('en-CA', {
-    timeZone: TZ,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).format(new Date());
-
-// Check the weekday in Finland (used to skip weekends).
-const weekday = () =>
-  new Intl.DateTimeFormat('en-US', {
-    timeZone: TZ,
-    weekday: 'short'
-  }).format(new Date());
-
-// OpenAI client for translating Finnish menus into English.
-const ai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
-// Open each configured source in Chromium and extract its visible text.
-// A new browser is launched for each call, so old page content is not reused.
-async function getPages() {
-  console.log('Starting restaurant menu scraping...');
-
-  const browser = await chromium.launch({
-    headless: true
-  });
-
-  try {
-    const results = [];
-
-    for (const restaurant of restaurants) {
-      console.log(`Fetching: ${restaurant.name}`);
-
-      const page = await browser.newPage({
-        locale: 'fi-FI'
+async function main() {
+  const mode = parseMode(process.argv.slice(2));
+  if (mode === 'groups') {
+    const whatsapp = createWhatsApp(log);
+    whatsapp.onReady(() => {
+      whatsapp.listAndClose().catch(error => {
+        log('group_listing_failed', { error: error.message });
+        process.exitCode = 1;
       });
-
-      try {
-        await page.goto(restaurant.url, {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000
-        });
-
-        await page.waitForTimeout(2500);
-
-        const content = (
-          await page.locator('body').innerText({
-            timeout: 10000
-          })
-        ).slice(0, 45000);
-
-        results.push({
-          ...restaurant,
-          content
-        });
-
-        console.log(`Fetched: ${restaurant.name}`);
-
-      } catch (e) {
-        console.error(
-          `Failed fetching ${restaurant.name}:`,
-          e.message
-        );
-
-        results.push({
-          ...restaurant,
-          error: String(e.message)
-        });
-
-      } finally {
-        await page.close();
-      }
-    }
-
-    return results;
-
-  } finally {
-    await browser.close();
-  }
-}
-
-
-// Ask OpenAI to translate and format the scraped menus for WhatsApp.
-async function makeMessage(pages) {
-  const date = dateStr();
-
-  console.log('Translating menus with OpenAI...');
-
-  const response = await ai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-    temperature: 0,
-    messages: [
-      {
-        role: 'system',
-        content: `You create a simple, mobile-friendly English WhatsApp lunch menu.
-
-Today in Finland: ${date} (${weekday()}).
-
-SOURCE:
-The input contains the daily lunch menu from Kurnii, including multiple restaurants.
-
-TASK:
-Translate the COMPLETE menu for today's date into English.
-Your job is to translate and organize the menu, NOT summarize it.
-
-IMPORTANT:
-Completeness is more important than brevity.
-Do not remove any lunch options to make the output shorter.
-
-RESTAURANT ORDER:
-Output restaurants in exactly this order:
-1. MATHILDA
-2. SERVERI
-3. ALERE
-4. FABRIIKKI
-5. W33
-6. COTTON CLUB
-
-Always include all six restaurants, even when closed or without a menu.
-
-MENU EXTRACTION AND GROUPING:
-
-The source is a Finnish lunch menu organized into restaurant
-sections and meal categories.
-
-FINNISH MENU CATEGORIES:
-- Kasvislounas = Vegetarian lunch
-- Kotiruokalounas = Home-style lunch
-- Lounas = Lunch
-- Erikoisannos = Special lunch
-- Salaattilounas = Salad lunch
-- Jälkiruoka = Dessert
-- Päivän keitto = Soup of the day
-- Leipätarjonta = Bread selection
-
-IMPORTANT RULES:
-- Identify each restaurant and its menu categories.
-- Every category containing food must be represented.
-- Include ALL dishes, sides and sauces within each category.
-- Combine items belonging to one complete meal on ONE line.
-- Never split one meal into multiple lines.
-- Never omit salad lunches or desserts.
-- Do not combine unrelated meal categories.
-- Do not invent dishes or ingredients.
-- Translate all Finnish dish names into English.
-
-EXAMPLES:
-
-Mathilda - Kasvislounas:
-🌱 Beetroot falafel patties + roasted potatoes + lime-chili yoghurt
-
-Fabriikki - Salaattilounas:
-🥗 Mozzarella + egg + marinated tofu
-
-Fabriikki - Jälkiruoka:
-🍰 Pancake + strawberry jam
-
-Only output these example dishes if they are present
-in today's actual source menu.
-
-SPECIAL LUNCH:
-- For Mathilda, label dishes listed under the Special Dish category as:
-  ⭐ SPECIAL LUNCH: Dish + side + sauce
-- Do not label ordinary dishes as special.
-
-ALLERGEN AND DIETARY LABELS:
-- Never include allergen codes or dietary abbreviations.
-- Remove labels such as (G), (L), (M), (VEG), (MU), (V).
-- Remove parenthetical dietary notes such as (includes organic).
-- Keep actual food ingredients and dish names unchanged.
-- Do not remove food names or ingredients.
-
-LANGUAGE:
-- Translate ALL Finnish and Swedish food names into natural English.
-- Never leave Finnish dish names untranslated.
-- Preserve the original meaning of every dish.
-- Do not change ingredients or preparation methods.
-
-RESTAURANT AVAILABILITY:
-
-- Always include all six restaurants in the specified order.
-- If a restaurant has a menu for today, translate all its available dishes.
-- If a restaurant is explicitly marked as closed, output:
-  🔴 CLOSED
-- If the source says "Suljettu tai ei listaa saatavilla",
-  output:
-  ❔ CLOSED OR MENU NOT AVAILABLE
-- If no menu is published for today, output:
-  ❔ MENU NOT AVAILABLE
-- Never assume a restaurant is closed just because its menu is missing.
-- Never copy dishes from another day.
-- Never invent missing lunch options.
-- If a category such as dessert, soup or salad is absent,
-  simply omit that category.
-- Do not output placeholder dishes for missing categories.
-
-OUTPUT FORMAT:
-- Plain text only.
-- No Markdown, bold formatting or asterisks.
-- Use restaurant headings in uppercase, prefixed with 🏫.
-- Start each meal line with an appropriate food emoji.
-- One meal per line.
-- Use + between the main dish, sides and sauces.
-- Keep each line concise and mobile-friendly.
-- Use one blank line between restaurants.
-- No prices, allergen codes or dietary abbreviations.
-- Do not repeat the date or title.
-- No explanations or closing remarks.
-
-FINAL CHECK BEFORE RESPONDING:
-1. Check that every restaurant with today's menu is included.
-2. Check that every main dish from the source is represented.
-3. Check that vegetarian meals are included.
-4. Check that soup, salad and dessert options are included when listed.
-5. Check that all dish names are translated into English.
-6. Check that the restaurant order is correct.
-
-Return ONLY the complete formatted lunch menu.
-
-Example:
-🏫 SERVERI
-🌱 Vegan nuggets + potatoes + yoghurt sauce
-🍖 Frikadelles + rosemary sauce + potatoes
-🥣 Pea soup + pancakes + jam
-
-Return ONLY the formatted menu.`
-      },
-      {
-        role: 'user',
-        content: JSON.stringify(pages)
-      }
-    ]
-  });
-
-  console.log('Translation completed.');
-
-  return `🍽️ SCHOOL LUNCH — ${date}\n\n${
-    response.choices[0]?.message?.content?.trim()
-    || 'No verified menu available.'
-  }`;
-}
-
-
-// Main lunch job: skip weekends/duplicates, fetch fresh data, and send once.
-async function run(client) {
-  console.log('Starting menu job...');
-
-  if (!['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].includes(weekday())) {
-    console.log('Weekend detected. Skipping.');
+    });
+    await whatsapp.start();
     return;
   }
 
-  const date = dateStr();
-  // sent-state.json prevents duplicate messages for the same day.
-  const stateFile = new URL('./sent-state.json', import.meta.url);
-
-  let state = {};
-
-  try {
-    state = JSON.parse(
-      await fs.readFile(stateFile, 'utf8')
-    );
-  } catch {}
-
-  if (!dryRun && state.lastSent === date) {
-    console.log('Already sent today.');
-    return;
-  }
-
-  // Always fetch the current page when the job runs.
-  const pages = await getPages();
-  await fs.writeFile(
-        'debug-menus.json',
-        JSON.stringify(pages, null, 2),
-        'utf8');
-  const msg = await makeMessage(pages);
-
-  if (dryRun) {
-    console.log('\n--- MENU PREVIEW ---\n');
-    console.log(msg);
-    return;
-  }
-
-  const id = process.env.WHATSAPP_GROUP_ID;
-
-  if (!id || !id.endsWith('@g.us')) {
-    throw new Error(
-      'Configure WHATSAPP_GROUP_ID in .env first'
-    );
-  }
-
-  console.log('Sending menu to WhatsApp...');
-
-  await client.sendMessage(id, msg);
-
-  // Save the successful send date for duplicate protection.
-  await fs.writeFile(
-    stateFile,
-    JSON.stringify({
-      lastSent: date,
-      at: new Date().toISOString()
-    }, null, 2)
-  );
-
-  console.log('Successfully sent menu:', date);
-}
-
-// -----------------------------------------------------------------------------
-// Application entry point
-// -----------------------------------------------------------------------------
-// Dry-run mode previews today's menu without connecting to WhatsApp.
-if (dryRun) {
-  await run(null);
-} else {
-  // LocalAuth keeps the WhatsApp login session between bot restarts.
-  const client = new Client({
-    authStrategy: new LocalAuth({
-      clientId: 'vamk-lunch'
-    }),
-    puppeteer: {
-      headless: true,
-      // Windows Chrome path; replace or configure this when deploying to Linux.
-      executablePath:
-        'C:\\Users\\Verttzzz\\.cache\\puppeteer\\chrome\\win64-154.0.8037.57\\chrome-win64\\chrome.exe',
-      args: ['--no-sandbox'],
-      timeout: 120000
-    }
-  });
-
-  // Display a QR code if WhatsApp requires a new login.
-  client.on('qr', qr => {
-    console.log('Scan WhatsApp QR code:');
-    qrcode.generate(qr, { small: true });
-  });
-
-  // Report authentication problems in the terminal.
-  client.on('auth_failure', error => {
-    console.error('WhatsApp auth failure:', error);
-  });
-
-  // Avoid registering the same scheduled jobs more than once.
-  let schedulesRegistered = false;
-
-  // Start scheduled jobs only after the WhatsApp client is ready.
-  client.on('ready', async () => {
-    console.log('WhatsApp connected.');
-
-    // Optional utility mode: list WhatsApp groups and exit.
-    if (listGroups) {
-      const chats = await client.getChats();
-      for (const chat of chats.filter(chat => chat.isGroup)) {
-        console.log(`${chat.name} | ${chat.id._serialized}`);
-      }
-      await client.destroy();
-      process.exit(0);
-    }
-
-    // SEND_ON_START=true sends immediately after WhatsApp connects.
-    // Keep it false for normal scheduled operation.
-    const sendOnStart = (process.env.SEND_ON_START || '')
-      .trim()
-      .toLowerCase() === 'true';
-
-    console.log('SEND_ON_START raw:', JSON.stringify(process.env.SEND_ON_START));
-    console.log('Immediate sending enabled:', sendOnStart);
-
-    if (schedulesRegistered) {
-      console.log('Scheduled jobs already registered.');
+  const sources = JSON.parse(await fs.readFile(path('./restaurants.json'), 'utf8'));
+  const menu = createMenuService({ sources, log, artifacts });
+  if (mode === 'preview') {
+    const { date, weekday } = helsinki();
+    if (['Sat', 'Sun'].includes(weekday)) {
+      console.log('Weekend detected. Skipping.');
       return;
     }
-    schedulesRegistered = true;
+    const result = await menu.getMenu(date);
+    if (result.status !== 'ready') throw new Error('No verified menu for today');
+    console.log('\n--- MENU PREVIEW ---\n\n' + result.body);
+    return;
+  }
 
-    // Every weekday at 07:00 Finland time: fetch, translate and send the menu.
-    cron.schedule('0 7 * * 1-5', () => {
-      console.log('⏰ Scheduled lunch job triggered.');
-      run(client).catch(error => {
-        console.error('❌ Scheduled lunch job failed:', error);
-      });
-    }, { timezone: TZ });
+  if (mode === 'test-send' || mode === 'send-production') {
+    await runManualSend(mode, { env: process.env, createClient: () => createWhatsApp(log),
+      createState, menu, log });
+    return;
+  }
 
-    // Every Monday at 01:00 Finland time: check that Kurnii can be fetched.
-    // This does NOT cache menu data or send a WhatsApp message.
-    cron.schedule('0 1 * * 1', async () => {
-      console.log('🔄 Monday Kurnii check started.');
-      try {
-        const pages = await getPages();
+  const playground = mode === 'scheduled-playground';
+  const { group, legacyGroup } = resolveGroups(process.env, playground);
+  const whatsapp = createWhatsApp(log);
+  const state = createState(legacyGroup);
+  const scheduler = createScheduler({ group, state, isReady: whatsapp.isReady,
+    prepare: menu.prepareDelivery, send: whatsapp.send, probe: menu.probe, log });
 
-        
-        const successful = pages.filter(page => !page.error).length;
-        console.log(`Kurnii check: ${successful}/${pages.length} source(s) fetched.`);
-      } catch (error) {
-        console.error('❌ Monday Kurnii check failed:', error);
-      }
-    }, { timezone: TZ });
-
-    console.log('Scheduled weekdays 07:00 and Mondays 01:00 Europe/Helsinki.');
-
-    // Optional immediate run for manual testing or startup sending.
-    if (sendOnStart) {
-      console.log('Starting immediate send...');
-      try {
-        await run(client);
-        console.log('Immediate send finished.');
-      } catch (error) {
-        console.error('Immediate send failed:', error);
-      }
-    } else {
-      console.log('Immediate send disabled. Waiting for 07:00.');
-    }
+  // A minute tick covers 07:00 and the catch-up window, including reconnections.
+  let firstReady = true;
+  whatsapp.onReady(() => {
+    const immediate = firstReady && process.env.SEND_ON_START?.trim().toLowerCase() === 'true';
+    firstReady = false;
+    return scheduler.tick({ immediate });
   });
+  await whatsapp.start();
+  cron.schedule('* * * * 1-5', () => scheduler.tick(), { timezone: TZ });
+  cron.schedule('0 1 * * 1', () => scheduler.probe(), { timezone: TZ });
+  setInterval(() => log('heartbeat', { whatsappReady: whatsapp.isReady() }), 5 * 60 * 1000);
+  log('scheduler_started', { timezone: TZ, destination: playground ? 'playground' : 'production' });
+}
 
-  // Connect to WhatsApp Web and keep the process alive.
-  await client.initialize();
+try {
+  await main();
+} catch (error) {
+  log('bot_failed', { error: error.message });
+  process.exitCode = 1;
 }
