@@ -296,6 +296,10 @@ async function run(client) {
 
   // Always fetch the current page when the job runs.
   const pages = await getPages();
+  await fs.writeFile(
+        'debug-menus.json',
+        JSON.stringify(pages, null, 2),
+        'utf8');
   const msg = await makeMessage(pages);
 
   if (dryRun) {
@@ -341,7 +345,7 @@ if (dryRun) {
       clientId: 'vamk-lunch'
     }),
     puppeteer: {
-      headless: false,
+      headless: true,
       // Windows Chrome path; replace or configure this when deploying to Linux.
       executablePath:
         'C:\\Users\\Verttzzz\\.cache\\puppeteer\\chrome\\win64-154.0.8037.57\\chrome-win64\\chrome.exe',
@@ -407,6 +411,8 @@ if (dryRun) {
       console.log('🔄 Monday Kurnii check started.');
       try {
         const pages = await getPages();
+
+        
         const successful = pages.filter(page => !page.error).length;
         console.log(`Kurnii check: ${successful}/${pages.length} source(s) fetched.`);
       } catch (error) {
